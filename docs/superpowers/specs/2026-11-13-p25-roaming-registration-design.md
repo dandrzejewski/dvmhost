@@ -26,7 +26,8 @@ matches the site's; otherwise the extended alternate multi-block format is requi
 - `ControlSignaling::writeRF_TSDU_U_Reg_Rsp()` denies any U_REG_REQ whose System
   ID differs from the site's, using REG_DENY. REG_DENY means "not allowed at this
   location" and drives the SU into control channel hunting (AABD §5.4.4(c),
-  §5.4.5(c), §6.4.1.1). REG_REFUSED is the code for "not allowed on this system".
+  §5.4.5(c), §6.4.1.1). REG_REFUSED is the code for "not allowed on this system";
+  see §4 for why roaming admission failures nevertheless keep REG_DENY.
 - The WACN ID in U_REG_REQ is decoded but never checked.
 - `IOSP_U_REG::encode()` always writes the site System ID, and the WUID always
   equals the Unit ID. No WUID pool or SUID-to-WUID mapping exists.
@@ -81,11 +82,12 @@ Location: `src/host/p25/lookups/P25WuidLookup.h/.cpp`.
   System ID and WUID = Unit ID, so encoded bytes are unchanged.
 - New `MBT_OSP_U_REG_RSP` (alternate multi-block, AABC §6.2.21.2, Figure 6.2.21-2):
   header carries Source Address (WUID) and the WACN ID upper bits; the data block
-  carries WACN ID lower bits, System ID, Source ID, and RV. Routed through the
-  existing TSBK factory. In this scope it is only used to refuse SUs with a
-  different WACN ID.
-- The "No unit" WUID value used as Source Address for a refused extended response
-  is taken from TIA-102.BAAC-C during planning, not assumed.
+  carries WACN ID lower bits, System ID, Source ID, and RV. Included from
+  `TSBKFactory.h` with the other MBT headers; no factory decode case is added
+  because the host never receives this outbound message. In this scope it is only
+  used to deny SUs with a different WACN ID.
+- The Source Address for a denied response with no WUID is `$000000` ("No one",
+  TIA-102.BAAC-C).
 
 ### 3.3 Registration logic (`ControlSignaling`)
 
@@ -108,15 +110,14 @@ The ACK_RSP_FNE behavior is unchanged. All checks complete before any registrati
 affiliation, or WUID state is mutated.
 
 1. **Different WACN ID** — extended-format U_REG_RSP (`MBT_OSP_U_REG_RSP`) with
-   REG_REFUSED.
+   REG_DENY.
 2. **Same System ID (Home SU)** — existing path: RID ACL, `requireLLAForReg`, and
    automatic inhibit; WUID = Unit ID. Addition: a Home Unit ID inside the roaming
    pool is answered with REG_REFUSED and a logged configuration-conflict reason
    (pool IDs cannot be Home Unit IDs, AABD §6.2).
 3. **Different System ID, same WACN ID (roaming SU)**:
-   1. `allowRoaming` false → REG_REFUSED. This intentionally replaces the current
-      REG_DENY.
-   2. `roamingSysIds` non-empty and not containing the System ID → REG_REFUSED.
+   1. `allowRoaming` false → REG_DENY. This preserves the current response.
+   2. `roamingSysIds` non-empty and not containing the System ID → REG_DENY.
    3. `requireLLAForReg` is not evaluated for roaming SUs. No AUTH_DMD is sent.
    4. The RID ACL is not evaluated and automatic inhibit is never applied to
       roaming SUs; the Unit ID belongs to another system's numbering space.
@@ -128,6 +129,20 @@ affiliation, or WUID state is mutated.
       the Unit ID as Source ID, and the WUID as Source Address.
 4. **Re-registration** of the same SUID returns the same WUID and restarts its
    timer.
+
+### Deny versus refuse
+
+Strictly, an SU whose home system may not register on this system is a REG_REFUSED
+case (AABD §6.4.1.1 d). However, an SU receiving REG_REFUSED "may go to the 'Invalid
+ID' state and discontinue further registration attempts" and "shall await further
+user input" (AABD §6.4.1.2 e), while REG_DENY makes the SU record the site as denied
+and return to control channel hunting (AABD §6.4.1.2 b), eventually reaching its home
+system without user action. Because only SUs already provisioned to accept this
+WACN/System ID ever register here (AABD §5.4.5), a refused SU could be left on a
+system that will not serve it. To avoid stranding public-safety SUs, every roaming
+admission failure (foreign WACN, roaming disabled, System ID not permitted, pool
+exhausted) uses REG_DENY. REG_REFUSED is used only for a Home SU whose Unit ID lies in
+the roaming pool, which is a local provisioning error.
 
 Each outcome logs the WACN ID, System ID, Unit ID, assigned WUID (when present), and
 reason. Activity log entries extend the existing "unit registration request from
@@ -149,6 +164,10 @@ affiliation, or network state changes.
 | Data channel / SNDCP requests | DENY_RSP, `DENY_SYS_UNSUPPORTED_SVC`. |
 | Status update, message update, call alert, extended function | DENY_RSP, `DENY_SYS_UNSUPPORTED_SVC`. |
 | Emergency alarm | Acknowledged normally; logged as a warning and activity-log entry with SUID, WUID, and site. Not forwarded to the network until sub-project 3. |
+| ACK, status query, group affiliation query, authentication, and radio monitor responses | Ignored (logged at verbose). |
+
+GRP_AFF_REQ, LOC_REG_REQ, and U_DE_REG_REQ from a roaming SU restart its WUID
+validity timer.
 
 Denials log the reason "roaming unit service not supported (requires roaming
 translation)".
@@ -168,7 +187,8 @@ roaming SUs re-register.
 
 ## 6. Configuration
 
-New keys in `protocols.p25.control` of `configs/config.example.yml`, placed after
+New keys directly under `protocols.p25` of `configs/config.example.yml` (beside the
+existing registration keys read via `p25Protocol[...]`), placed after
 `requireLLAForReg`:
 
 ```yaml
@@ -214,8 +234,8 @@ handling, pool provisioning requirements, and the lack of LLA for roaming SUs.
   single-ID pool, release and reuse, unknown release, bidirectional lookup, and
   pool boundaries (start, end, start − 1, end + 1).
 - Registration flow via `tests/p25/HostControl_Tests.cpp`: Home accept; Home Unit ID
-  in pool refused; different WACN extended REFUSED; roaming disabled REFUSED (not
-  DENY); System ID not in list REFUSED; empty list accept; roaming accept with
+  in pool refused; different WACN extended DENY; roaming disabled DENY; System ID
+  not in list DENY; empty list accept; roaming accept with
   `requireLLAForReg` enabled and no AUTH_DMD; pool exhaustion DENY;
   re-registration retains WUID; de-registration and timer expiry release the WUID.
 - Interim services: GRP_AFF accepted locally without network announcement; voice
