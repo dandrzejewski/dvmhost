@@ -91,8 +91,9 @@ Location: `src/host/p25/lookups/P25WuidLookup.h/.cpp`.
 
 ### 3.3 Registration logic (`ControlSignaling`)
 
-`writeRF_TSDU_U_Reg_Rsp(uint32_t srcId, uint32_t sysId)` becomes a function taking
-the requesting SUID. It classifies the request, allocates a WUID when required, and
+`writeRF_TSDU_U_Reg_Rsp(uint32_t srcId, uint32_t sysId)` becomes
+`writeRF_TSDU_U_Reg_Rsp(const lookups::P25WuidLookup::SUID& suid)`, taking the
+requesting SUID. It classifies the request, allocates a WUID when required, and
 selects the response code and format (§4).
 
 The ISP_AUTH_RESP success path continues to produce a Home SU response; roaming SUs
@@ -174,15 +175,17 @@ translation)".
 
 Defensive guard: RF voice and data paths do not write a pool `srcId` to the network.
 
-A service request carrying an unassigned pool WUID is answered with U_REG_CMD
-(AABD §6.6.1).
+A request carrying an unassigned pool WUID is answered with U_REG_CMD (AABD §6.6.1).
+This check precedes the table above, so the ignored responses also receive U_REG_CMD
+when sent from an unassigned WUID. Only U_REG_REQ bypasses the roaming service policy.
 
 ### WUID release
 
 `P25AffiliationLookup` already invokes the unit de-registration callback for
 U_DE_REG_REQ, WUID validity timer expiry, and REST-forced de-registration.
-`p25::Control` extends that callback: when `isPoolWuid(srcId)`, call
-`m_wuidLookup->release(srcId)`. The pool is in-memory only; a restart clears it and
+`p25::Control` handles that callback in the private `processUnitDereg()`: when
+`isPoolWuid(srcId)`, call `m_wuidLookup->release(srcId)` and suppress the network
+de-registration announcement. The pool is in-memory only; a restart clears it and
 roaming SUs re-register.
 
 ## 6. Configuration
